@@ -4,8 +4,12 @@ Provides two entry points sharing a single source of truth (``_SimulationRun``):
 
   - ``simulate(spec, ...)``  — runs the whole batch and returns a
     ``SimulationResult`` (collect-all). Used by tests and the offline driver.
-  - ``simulate_iter(spec, ...)`` — yields one ``Sample`` per integration
-    step (streaming). Used by MQTT/file/callback sinks.
+  - ``simulate_iter(spec, ...)`` — returns a ``SampleStream`` yielding one
+    ``Sample`` per integration step (streaming). Used by MQTT/file/callback
+    sinks. When the batch has an attached Recipe, ``SampleStream.control``
+    exposes the live ``RecipeExecutor`` so another thread can
+    pause/resume/advance_phase/abort an in-flight batch — see
+    ``SampleStream``'s docstring.
 
 Both run the same per-step physics. Per-sample pH and Q conversions are
 applied in the ``Sample`` so streaming consumers see plant-readable units;
@@ -24,7 +28,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -38,6 +41,7 @@ from indpensim.pat.pls_model import PAAPLSModel
 from indpensim.pat.raman import build_reference, simulate_spectrum
 from indpensim.pat.substrate import predict_and_store
 from indpensim.recipe.executor import RecipeExecutor
+from indpensim.recipe.types import PhaseState
 from indpensim.streaming.sample import Sample, StreamConfig
 
 _REFERENCE_SPECTRA_PATH = Path(__file__).resolve().parents[1] / "data" / "reference_Specra.txt"
@@ -449,6 +453,48 @@ def simulate(
     )
 
 
+class SampleStream:
+    """Iterator returned by ``simulate_iter``.
+
+    Behaves exactly like the plain generator it replaces — drive it with
+    ``for sample in stream:`` or ``list(stream)`` — but exposes ``.control``,
+    the batch's live ``RecipeExecutor`` (``None`` when no Recipe is
+    attached). Code on another thread can call
+    ``stream.control.pause()/.resume()/.advance_phase()/.abort()`` on that
+    handle while this thread is mid-iteration, to steer an in-flight batch.
+
+    Once the executor's ``phase_state`` becomes ``ABORTED``, the stream
+    yields the in-flight sample and then stops — it never reaches ``N``.
+    """
+
+    def __init__(self, run: "_SimulationRun") -> None:
+        self._run = run
+        self._k = 0
+        self._done = False
+
+    def __iter__(self) -> "SampleStream":
+        return self
+
+    def __next__(self) -> Sample:
+        if self._done:
+            raise StopIteration
+        self._k += 1
+        if self._k > self._run.N:
+            self._done = True
+            self._run.finalize()
+            raise StopIteration
+        sample = self._run.step(self._k)
+        exec_ = self._run.recipe_exec
+        if exec_ is not None and exec_.phase_state is PhaseState.ABORTED:
+            self._done = True
+            self._run.finalize()
+        return sample
+
+    @property
+    def control(self) -> RecipeExecutor | None:
+        return self._run.recipe_exec
+
+
 def simulate_iter(
     cap: CapturedBatch,
     *,
@@ -458,18 +504,20 @@ def simulate_iter(
     raman_rng: np.random.Generator | None = None,
     raman_noise_traj: np.ndarray | None = None,
     stream_config: StreamConfig | None = None,
-) -> Iterator[Sample]:
+) -> SampleStream:
     """Yield one ``Sample`` per integration step.
 
     Same physics as ``simulate()``. Use this for streaming sinks
     (MQTT, jsonlines, callbacks). Per-sample pH and Q are converted to
     plant-readable units in the yielded Sample's state dict.
+
+    Returns a ``SampleStream`` — iterate it like the generator it replaces,
+    or hold onto it and use ``.control`` to steer a Recipe-driven batch
+    while it's streaming (see ``SampleStream``).
     """
     run = _SimulationRun(
         cap, ctrl_flags=ctrl_flags, rtol=rtol, atol=atol,
         raman_rng=raman_rng, raman_noise_traj=raman_noise_traj,
         stream_config=stream_config,
     )
-    for k in range(1, run.N + 1):
-        yield run.step(k)
-    run.finalize()
+    return SampleStream(run)

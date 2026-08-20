@@ -303,16 +303,120 @@ def test_resolved_setpoints_carry_per_phase_t_ph_overrides():
     assert out2.pH_sp == 6.3
 
 
-def test_executor_mutator_hooks_raise():
+# ---------------------------------------------------------------------------
+# Mutator hooks — pause/resume/advance_phase/abort
+# ---------------------------------------------------------------------------
+
+def test_pause_stops_automatic_advance():
     ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
-    with pytest.raises(NotImplementedError):
+    h = _empty_history()
+    for k in range(1, 6):
+        ex.step(k, h)
+    ex.pause()
+    assert ex.phase_state == PhaseState.HELD
+    # Would have fired at k=11 if still RUNNING — confirm it does not.
+    out = None
+    for k in range(6, 20):
+        out = ex.step(k, h)
+        assert ex.current_phase.name == "P1"
+    # The setpoint schedule itself keeps resolving normally while HELD.
+    assert out.Fs == 10.0
+
+
+def test_resume_excludes_held_time_from_max_hours():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    for k in range(1, 6):
+        ex.step(k, h)
+    ex.pause()
+    for k in range(6, 16):        # held for 10 samples (k=6..15)
+        ex.step(k, h)
+    ex.resume()
+    # time_in_phase = (k - phase_start_k - held_samples)*h = (k - 1 - 10)*0.2
+    # fires when >= 2.0 -> k >= 21 (not k=11, since held time doesn't count).
+    for k in range(16, 21):
+        out = ex.step(k, h)
+        assert ex.current_phase.name == "P1"
+    out = ex.step(21, h)
+    assert ex.current_phase.name == "P2"
+
+
+def test_advance_phase_forces_transition_bypassing_trigger():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    for k in range(1, 4):
+        ex.step(k, h)
+    ex.advance_phase(reason="operator")
+    assert ex.current_phase.name == "P2"
+    assert ex.phase_state == PhaseState.RUNNING
+    assert ex.transitions[-1] == PhaseTransitionLog(
+        from_phase="P1", to_phase="P2", at_k=3, at_time_h=3 * 0.2, reason="operator",
+    )
+
+
+def test_advance_phase_from_held_implicitly_resumes():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.step(1, _empty_history())
+    ex.pause()
+    assert ex.phase_state == PhaseState.HELD
+    ex.advance_phase()
+    assert ex.phase_state == PhaseState.RUNNING
+    assert ex.current_phase.name == "P2"
+
+
+def test_abort_marks_aborted_and_logs_transition():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    for k in range(1, 4):
+        ex.step(k, h)
+    ex.abort(reason="emergency stop")
+    assert ex.phase_state == PhaseState.ABORTED
+    assert ex.transitions[-1] == PhaseTransitionLog(
+        from_phase="P1", to_phase=None, at_k=3, at_time_h=3 * 0.2, reason="emergency stop",
+    )
+    # step() still resolves the current phase's setpoints normally afterward
+    # — SampleStream is what stops the outer loop, not the executor itself.
+    out = ex.step(4, h)
+    assert out.Fs == 10.0
+
+
+def test_pause_rejects_when_not_running():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.pause()
+    with pytest.raises(RuntimeError, match="HELD"):
         ex.pause()
-    with pytest.raises(NotImplementedError):
+
+
+def test_resume_rejects_when_not_held():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    with pytest.raises(RuntimeError, match="RUNNING"):
         ex.resume()
-    with pytest.raises(NotImplementedError):
+
+
+def test_advance_phase_rejects_when_complete():
+    recipe = _make_recipe([
+        Phase(name="ONLY", setpoints=SetpointProfile(),
+              transition=TransitionTrigger(max_hours=0.0)),
+    ])
+    ex = RecipeExecutor(recipe=recipe, h=0.2)
+    ex.step(1, _empty_history())
+    assert ex.phase_state == PhaseState.COMPLETE
+    with pytest.raises(RuntimeError, match="COMPLETE"):
         ex.advance_phase()
-    with pytest.raises(NotImplementedError):
+
+
+def test_abort_rejects_when_already_aborted():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.abort()
+    with pytest.raises(RuntimeError, match="ABORTED"):
         ex.abort()
+
+
+def test_mutator_before_any_step_uses_k_zero_as_timestamp():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.advance_phase(reason="early")
+    assert ex.transitions[-1].at_k == 0
+    assert ex.transitions[-1].at_time_h == 0.0
 
 
 def test_recipe_rejects_duplicate_phase_names():

@@ -49,6 +49,15 @@ def test_simulate_iter_yields_correct_count(short_spec):
     assert samples[0].wall_time_s is None       # unpaced
 
 
+def test_simulate_iter_control_is_none_without_recipe(short_spec):
+    """Legacy (no-Recipe) runs expose .control as None but stream normally."""
+    from indpensim.simulation import simulate_iter
+    stream = simulate_iter(short_spec)
+    assert stream.control is None
+    expected = int(round(short_spec.T / short_spec.h))
+    assert len(list(stream)) == expected
+
+
 def test_simulate_iter_matches_simulate(short_spec):
     """Regression gate: collect all yielded samples, reconstruct trajectory,
     compare to simulate()'s SimulationResult."""

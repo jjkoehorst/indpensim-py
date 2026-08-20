@@ -13,12 +13,19 @@ simulation loop. It:
      ``SetpointProfile`` using first-match / fall-through-to-last
      semantics identical to the legacy ``controller._recipe_lookup``.
 
-Mutator hooks (``pause``/``resume``/``advance_phase``/``abort``) are
-deferred to Phase D of the plan — the MVP is step-only. The method
-stubs are present so call sites can reference them, but they raise.
+Mutator hooks (``pause``/``resume``/``advance_phase``/``abort``) let a
+second thread — e.g. an operator console driving a live ``simulate_iter``
+stream via its ``.control`` handle — reach into an in-flight batch between
+``step()`` calls. A single internal lock serializes each hook against
+``step()``'s own check-and-mutate section; this is enough to avoid a torn
+read/write for the expected one-control-thread/one-sim-thread usage, not a
+general concurrency framework. Each hook raises ``RuntimeError`` (naming
+the attempted operation and the actual state) when called from a state it
+doesn't accept — never a silent no-op.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -103,6 +110,9 @@ class RecipeExecutor:
     _phase_state: PhaseState = PhaseState.RUNNING
     _transitions: list[PhaseTransitionLog] = field(default_factory=list)
     _drained: int = 0                        # cursor for streaming drain
+    _held_samples: int = 0                   # samples elapsed while HELD, this phase
+    _last_k: int = 0                         # most recent k seen by step()
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def current_phase(self) -> Phase:
@@ -126,12 +136,18 @@ class RecipeExecutor:
     def step(self, k: int, history: BatchHistory) -> ResolvedSetpoints:
         # Advance phases while triggers fire (normally at most once per step,
         # but a chain of zero-duration phases could cascade).
-        while self._phase_state == PhaseState.RUNNING:
-            time_in_phase = (k - self._phase_start_k) * self.h
-            phase = self.current_phase
-            if not _trigger_fires(phase.transition, time_in_phase, history, k):
-                break
-            self._advance(k, reason="trigger")
+        with self._lock:
+            self._last_k = k
+            if self._phase_state == PhaseState.HELD:
+                self._held_samples += 1
+            while self._phase_state == PhaseState.RUNNING:
+                # _held_samples excludes any wall-time spent paused earlier
+                # in this phase from counting toward max_hours.
+                time_in_phase = (k - self._phase_start_k - self._held_samples) * self.h
+                phase = self.current_phase
+                if not _trigger_fires(phase.transition, time_in_phase, history, k):
+                    break
+                self._advance(k, reason="trigger")
 
         sp = self.current_phase.setpoints
         return ResolvedSetpoints(
@@ -148,6 +164,10 @@ class RecipeExecutor:
 
     # ------------------------------------------------------------------
     def _advance(self, k: int, *, reason: str) -> None:
+        # Only ever called from within a section already holding self._lock
+        # (step()'s while-loop, advance_phase()) — threading.Lock isn't
+        # reentrant, so this method must not acquire it itself.
+        self._held_samples = 0
         from_name = self.current_phase.name
         if self._phase_idx + 1 < len(self.recipe.phases):
             to_name = self.recipe.phases[self._phase_idx + 1].name
@@ -165,15 +185,56 @@ class RecipeExecutor:
                 at_k=k, at_time_h=k * self.h, reason="complete",
             ))
 
-    # ---- Mutator hooks — Phase D of the plan. MVP raises. --------------
-    def pause(self) -> None:                                  # pragma: no cover
-        raise NotImplementedError("pause() is Phase D")
+    # ---- Mutator hooks — live control from outside the sim loop. --------
+    def pause(self) -> None:
+        """Hold the current phase — stop automatic phase transitions.
 
-    def resume(self) -> None:                                 # pragma: no cover
-        raise NotImplementedError("resume() is Phase D")
+        The active phase's setpoint schedule keeps resolving by absolute
+        ``k`` as normal; only the transition-trigger check is skipped.
+        """
+        with self._lock:
+            if self._phase_state != PhaseState.RUNNING:
+                raise RuntimeError(
+                    f"cannot pause(): executor is {self._phase_state.name}, expected RUNNING"
+                )
+            self._phase_state = PhaseState.HELD
 
-    def advance_phase(self, reason: str | None = None) -> None:  # pragma: no cover
-        raise NotImplementedError("advance_phase() is Phase D")
+    def resume(self) -> None:
+        """Resume automatic phase transitions after ``pause()``."""
+        with self._lock:
+            if self._phase_state != PhaseState.HELD:
+                raise RuntimeError(
+                    f"cannot resume(): executor is {self._phase_state.name}, expected HELD"
+                )
+            self._phase_state = PhaseState.RUNNING
 
-    def abort(self, reason: str | None = None) -> None:       # pragma: no cover
-        raise NotImplementedError("abort() is Phase D")
+    def advance_phase(self, reason: str | None = None) -> None:
+        """Force an immediate transition to the next phase, bypassing its
+        trigger. Accepted from RUNNING or HELD — forcing an advance
+        implicitly un-pauses. Uses the ``k`` of the most recent ``step()``
+        call as the transition's timestamp.
+        """
+        with self._lock:
+            if self._phase_state not in (PhaseState.RUNNING, PhaseState.HELD):
+                raise RuntimeError(
+                    f"cannot advance_phase(): executor is {self._phase_state.name}, "
+                    "expected RUNNING or HELD"
+                )
+            self._advance(self._last_k, reason=reason or "advance")
+
+    def abort(self, reason: str | None = None) -> None:
+        """End the batch early. The streaming layer (``SampleStream``) stops
+        yielding further samples once it observes ``ABORTED``.
+        """
+        with self._lock:
+            if self._phase_state in (PhaseState.ABORTED, PhaseState.COMPLETE):
+                raise RuntimeError(
+                    f"cannot abort(): executor is already {self._phase_state.name}"
+                )
+            from_name = self.current_phase.name
+            self._phase_state = PhaseState.ABORTED
+            self._transitions.append(PhaseTransitionLog(
+                from_phase=from_name, to_phase=None,
+                at_k=self._last_k, at_time_h=self._last_k * self.h,
+                reason=reason or "abort",
+            ))

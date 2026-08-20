@@ -128,6 +128,43 @@ for sample in paced(simulate_iter(spec), Pacing.fixed_interval(2.0)):
     print(sample.sim_time_h, sample.state["P"], sample.state["T"])
 ```
 
+#### Live control
+
+`simulate_iter()` returns a `SampleStream`, not a plain generator. Hold onto
+it and its `.control` attribute gives you the batch's live `RecipeExecutor`
+(`None` for a batch with no attached Recipe) — safe to call from another
+thread while the main thread is mid-iteration, e.g. from an operator console
+that reacts to what it sees streaming past:
+
+```python
+import threading
+from indpensim.simulation import simulate_iter
+from indpensim.streaming.pacing import Pacing, paced
+
+stream = simulate_iter(spec)   # spec.batch.recipe must be set
+
+def operator_console():
+    input("press enter to pause...")
+    stream.control.pause()
+    input("press enter to resume...")
+    stream.control.resume()
+
+threading.Thread(target=operator_console, daemon=True).start()
+
+for sample in paced(stream, Pacing.accelerated(factor=1.0)):
+    print(sample.sim_time_h, sample.phase, sample.state["P"])
+```
+
+`pause()` stops automatic phase transitions (the setpoint schedule keeps
+resolving normally); `resume()` restarts them, and the time spent paused
+never counts against a phase's `max_hours` trigger. `advance_phase(reason=...)`
+forces an immediate transition to the next phase, bypassing its trigger —
+valid from a running or paused phase. `abort(reason=...)` ends the batch
+early: the stream yields one more sample (with `phase_state ==
+"ABORTED"`) and then stops. Calling a hook from a state it doesn't accept
+(e.g. `resume()` when not paused) raises `RuntimeError` naming the actual
+state — never a silent no-op.
+
 ### Recipe layer (optional)
 
 Authoring a phase-structured batch via the ISA-88-subset Recipe API:
@@ -187,7 +224,8 @@ The in-session default is `legacy_sbc_recipe()`.
 ```
 indpensim/
   driver.py           - multi-batch campaign + CLI
-  simulation.py       - main loop (port of indpensim.m)
+  simulation.py       - main loop (port of indpensim.m); simulate_iter()
+                        returns a SampleStream with a live .control handle
   ode/rhs.py          - 33-state ODE right-hand side (port of indpensim_ode.m)
   control/
     controller.py     - port of fctrl_indpensim.m (PID + SBC + faults + Raman PAA loop)
@@ -207,7 +245,8 @@ indpensim/
     mqtt_runner.py    - paho-mqtt publisher + CLI
   recipe/
     types.py          - Phase/Recipe/SetpointProfile/TransitionTrigger
-    executor.py       - stateful RecipeExecutor (transitions, phase log)
+    executor.py       - stateful RecipeExecutor (transitions, phase log,
+                        pause/resume/advance_phase/abort for live control)
     legacy.py         - legacy_sbc_recipe() — regression anchor
     io.py             - JSON round-trip
   ui/                 - optional Streamlit recipe studio (needs [ui] extra)

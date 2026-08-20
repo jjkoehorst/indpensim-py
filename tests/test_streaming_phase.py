@@ -159,6 +159,50 @@ def test_state_message_falls_back_to_default_without_recipe():
 
 
 # ---------------------------------------------------------------------------
+# .control — live steering of an in-flight stream
+# ---------------------------------------------------------------------------
+
+def test_control_is_recipe_executor_when_recipe_attached(short_recipe):
+    spec = _short_spec_with_recipe(short_recipe)
+    stream = simulate_iter(spec)
+    from indpensim.recipe.executor import RecipeExecutor
+    assert isinstance(stream.control, RecipeExecutor)
+
+
+def test_control_advance_phase_forces_transition_mid_stream(short_recipe):
+    spec = _short_spec_with_recipe(short_recipe)
+    stream = simulate_iter(spec)
+    samples = []
+    for sample in stream:
+        samples.append(sample)
+        if sample.k == 5:
+            stream.control.advance_phase(reason="operator")
+    # k=5 (idx 4) is still INOCULATE; the forced advance takes effect on the
+    # very next sample, well before INOCULATE's own trigger would fire (k=11).
+    assert samples[4].phase == "INOCULATE"
+    assert samples[5].phase == "GROWTH"
+    transition = samples[5].phase_transitions[0]
+    assert transition["from_phase"] == "INOCULATE"
+    assert transition["to_phase"] == "GROWTH"
+    assert transition["reason"] == "operator"
+
+
+def test_control_abort_ends_stream_early(short_recipe):
+    spec = _short_spec_with_recipe(short_recipe)
+    stream = simulate_iter(spec)
+    samples = []
+    for sample in stream:
+        samples.append(sample)
+        if sample.k == 7:
+            stream.control.abort(reason="emergency stop")
+    # One more sample (k=8) is yielded after the abort call, then the
+    # stream stops — well short of the batch's full 50 samples.
+    assert len(samples) == 8
+    assert samples[-1].k == 8
+    assert samples[-1].phase_state == "ABORTED"
+
+
+# ---------------------------------------------------------------------------
 # Batch-start message carries recipe metadata
 # ---------------------------------------------------------------------------
 
