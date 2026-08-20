@@ -22,6 +22,13 @@ read/write for the expected one-control-thread/one-sim-thread usage, not a
 general concurrency framework. Each hook raises ``RuntimeError`` (naming
 the attempted operation and the actual state) when called from a state it
 doesn't accept — never a silent no-op.
+
+``set_setpoint``/``set_setpoints`` go further: they force an individual
+resolved value (any ``ResolvedSetpoints`` field — a feed rate, ``T_sp``,
+``pH_sp``) to a fixed number regardless of the active phase's authored
+schedule. Unlike the phase-transition hooks, overrides persist across
+phase changes until explicitly cleared with ``clear_setpoint``/
+``clear_all_setpoints`` — advancing phases does not reset them.
 """
 from __future__ import annotations
 
@@ -61,6 +68,9 @@ class ResolvedSetpoints(NamedTuple):
     Fpaa: float
     T_sp: float | None = None
     pH_sp: float | None = None
+
+
+_OVERRIDABLE_FIELDS = frozenset(ResolvedSetpoints._fields)
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,7 @@ class RecipeExecutor:
     _drained: int = 0                        # cursor for streaming drain
     _held_samples: int = 0                   # samples elapsed while HELD, this phase
     _last_k: int = 0                         # most recent k seen by step()
+    _overrides: dict[str, float] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
@@ -135,7 +146,9 @@ class RecipeExecutor:
     # ------------------------------------------------------------------
     def step(self, k: int, history: BatchHistory) -> ResolvedSetpoints:
         # Advance phases while triggers fire (normally at most once per step,
-        # but a chain of zero-duration phases could cascade).
+        # but a chain of zero-duration phases could cascade). Setpoint
+        # resolution (incl. applying any live overrides) happens in the same
+        # locked section so it can't race a concurrent set_setpoint() call.
         with self._lock:
             self._last_k = k
             if self._phase_state == PhaseState.HELD:
@@ -149,18 +162,20 @@ class RecipeExecutor:
                     break
                 self._advance(k, reason="trigger")
 
-        sp = self.current_phase.setpoints
-        return ResolvedSetpoints(
-            Fs=_lookup(k, sp.Fs),
-            Foil=_lookup(k, sp.Foil),
-            Fg=_lookup(k, sp.Fg),
-            pressure=_lookup(k, sp.pressure),
-            Fdischarge=_lookup(k, sp.Fdischarge),
-            Fwater=_lookup(k, sp.Fwater),
-            Fpaa=_lookup(k, sp.Fpaa),
-            T_sp=sp.T_sp,
-            pH_sp=sp.pH_sp,
-        )
+            sp = self.current_phase.setpoints
+            resolved = {
+                "Fs": _lookup(k, sp.Fs),
+                "Foil": _lookup(k, sp.Foil),
+                "Fg": _lookup(k, sp.Fg),
+                "pressure": _lookup(k, sp.pressure),
+                "Fdischarge": _lookup(k, sp.Fdischarge),
+                "Fwater": _lookup(k, sp.Fwater),
+                "Fpaa": _lookup(k, sp.Fpaa),
+                "T_sp": sp.T_sp,
+                "pH_sp": sp.pH_sp,
+            }
+            resolved.update(self._overrides)
+            return ResolvedSetpoints(**resolved)
 
     # ------------------------------------------------------------------
     def _advance(self, k: int, *, reason: str) -> None:
@@ -238,3 +253,47 @@ class RecipeExecutor:
                 at_k=self._last_k, at_time_h=self._last_k * self.h,
                 reason=reason or "abort",
             ))
+
+    # ---- Live setpoint overrides — bypass the authored schedule entirely.
+    def set_setpoint(self, name: str, value: float) -> None:
+        """Force one resolved setpoint (e.g. ``"T_sp"``, ``"Fg"``) to a fixed
+        value, regardless of what the active phase's ``SetpointProfile``
+        authors. Persists across phase transitions (including forced ones)
+        until cleared with ``clear_setpoint()``/``clear_all_setpoints()``.
+
+        ``name`` must be one of ``ResolvedSetpoints._fields``.
+        """
+        if name not in _OVERRIDABLE_FIELDS:
+            raise ValueError(
+                f"unknown setpoint {name!r}; expected one of {sorted(_OVERRIDABLE_FIELDS)}"
+            )
+        with self._lock:
+            self._overrides[name] = float(value)
+
+    def set_setpoints(self, **values: float) -> None:
+        """Override several resolved setpoints at once. See ``set_setpoint``."""
+        unknown = set(values) - _OVERRIDABLE_FIELDS
+        if unknown:
+            raise ValueError(
+                f"unknown setpoint(s) {sorted(unknown)}; expected one of {sorted(_OVERRIDABLE_FIELDS)}"
+            )
+        with self._lock:
+            self._overrides.update({name: float(v) for name, v in values.items()})
+
+    def clear_setpoint(self, name: str) -> None:
+        """Revert one overridden setpoint to the active phase's authored
+        value. No-op if ``name`` wasn't overridden."""
+        with self._lock:
+            self._overrides.pop(name, None)
+
+    def clear_all_setpoints(self) -> None:
+        """Revert every overridden setpoint to the active phase's authored
+        values."""
+        with self._lock:
+            self._overrides.clear()
+
+    @property
+    def overrides(self) -> dict[str, float]:
+        """Read-only snapshot of the currently active setpoint overrides."""
+        with self._lock:
+            return dict(self._overrides)

@@ -419,6 +419,85 @@ def test_mutator_before_any_step_uses_k_zero_as_timestamp():
     assert ex.transitions[-1].at_time_h == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Live setpoint overrides — set_setpoint/set_setpoints/clear_*
+# ---------------------------------------------------------------------------
+
+def test_set_setpoint_overrides_resolved_value():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    ex.set_setpoint("T_sp", 305.0)
+    out = ex.step(1, h)
+    assert out.T_sp == 305.0
+    assert out.Fs == 10.0    # untouched fields keep resolving normally
+
+
+def test_set_setpoints_overrides_multiple_at_once():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    ex.set_setpoints(T_sp=305.0, Fg=99.0)
+    out = ex.step(1, h)
+    assert out.T_sp == 305.0
+    assert out.Fg == 99.0
+
+
+def test_override_persists_across_phase_transition():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    ex.set_setpoint("T_sp", 305.0)
+    for k in range(1, 12):
+        out = ex.step(k, h)
+    assert ex.current_phase.name == "P2"     # confirms the transition fired
+    assert out.T_sp == 305.0                 # override survived it
+    assert out.Fs == 20.0                    # P2's own authored value
+
+
+def test_clear_setpoint_reverts_to_authored_value():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    ex.set_setpoint("T_sp", 305.0)
+    ex.step(1, h)
+    ex.clear_setpoint("T_sp")
+    out = ex.step(2, h)
+    assert out.T_sp is None                  # back to P1's authored (unset) value
+
+
+def test_clear_setpoint_is_a_noop_when_not_overridden():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.clear_setpoint("T_sp")     # must not raise
+
+
+def test_clear_all_setpoints_removes_every_override():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    h = _empty_history()
+    ex.set_setpoints(T_sp=305.0, Fg=99.0)
+    ex.clear_all_setpoints()
+    out = ex.step(1, h)
+    assert out.T_sp is None
+    assert out.Fg == 0.0      # P1's SetpointProfile leaves Fg unset -> default 0.0
+
+
+def test_overrides_property_is_a_read_only_snapshot():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    ex.set_setpoint("T_sp", 305.0)
+    snapshot = ex.overrides
+    assert snapshot == {"T_sp": 305.0}
+    snapshot["T_sp"] = 999.0     # mutating the snapshot must not affect the executor
+    assert ex.overrides == {"T_sp": 305.0}
+
+
+def test_set_setpoint_rejects_unknown_name():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    with pytest.raises(ValueError, match="unknown setpoint"):
+        ex.set_setpoint("not_a_real_field", 1.0)
+
+
+def test_set_setpoints_rejects_unknown_name():
+    ex = RecipeExecutor(recipe=_two_phase_time_recipe(), h=0.2)
+    with pytest.raises(ValueError, match="unknown setpoint"):
+        ex.set_setpoints(T_sp=305.0, bogus=1.0)
+
+
 def test_recipe_rejects_duplicate_phase_names():
     with pytest.raises(ValueError, match="duplicate phase names"):
         _make_recipe([

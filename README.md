@@ -165,6 +165,25 @@ early: the stream yields one more sample (with `phase_state ==
 (e.g. `resume()` when not paused) raises `RuntimeError` naming the actual
 state — never a silent no-op.
 
+To change an actual value — a flow rate, `T_sp`, `pH_sp` — rather than which
+phase is active, use `set_setpoint`/`set_setpoints`. These force a fixed
+number regardless of what the active phase's `SetpointProfile` authors, and
+(unlike the phase hooks above) persist across phase transitions until you
+clear them:
+
+```python
+stream.control.set_setpoint("T_sp", 305.0)      # bump temperature setpoint
+stream.control.set_setpoints(Fg=60.0, pH_sp=6.8) # several at once
+
+stream.control.overrides          # {'T_sp': 305.0, 'Fg': 60.0, 'pH_sp': 6.8}
+stream.control.clear_setpoint("T_sp")            # revert just T_sp
+stream.control.clear_all_setpoints()             # revert everything
+```
+
+Valid names are any `ResolvedSetpoints` field: the 7 feed channels (`Fs`,
+`Foil`, `Fg`, `pressure`, `Fdischarge`, `Fwater`, `Fpaa`) plus `T_sp` and
+`pH_sp`. An unknown name raises `ValueError`.
+
 ### Recipe layer (optional)
 
 Authoring a phase-structured batch via the ISA-88-subset Recipe API:

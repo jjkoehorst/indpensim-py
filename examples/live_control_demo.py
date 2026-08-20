@@ -1,4 +1,5 @@
-"""Live control of a streaming batch — pause / resume / advance / abort.
+"""Live control of a streaming batch — pause / resume / advance / abort /
+override individual setpoints (flow rates, T_sp, pH_sp).
 
 Demonstrates the ``.control`` handle that ``simulate_iter()`` exposes on its
 ``SampleStream``: a second thread reaches into an in-flight batch and steers
@@ -41,6 +42,11 @@ def operator_console(stream) -> None:
     print("[console] forcing an early phase advance")
     stream.control.advance_phase(reason="operator override")
 
+    time.sleep(0.3)
+    print("[console] overriding Fg (aeration rate) to 99.0, regardless of phase")
+    stream.control.set_setpoint("Fg", 99.0)
+    print(f"[console] active overrides: {stream.control.overrides}")
+
     time.sleep(0.5)
     print("[console] aborting the batch")
     stream.control.abort(reason="operator stop")
@@ -62,12 +68,15 @@ def main() -> None:
     # fixed_interval paces one sample per 0.1 wall-seconds, giving the
     # console thread above real gaps to act in.
     last_phase = None
+    last_fg = None
     n = 0
     for sample in paced(stream, Pacing.fixed_interval(0.1)):
         n += 1
-        if sample.phase != last_phase:
-            print(f"k={sample.k:3d}  phase={sample.phase:<10}  state={sample.phase_state}")
-            last_phase = sample.phase
+        fg = sample.controls["Fg"]
+        if sample.phase != last_phase or fg != last_fg:
+            print(f"k={sample.k:3d}  phase={sample.phase:<10}  "
+                  f"state={sample.phase_state:<9}  Fg={fg:.1f}")
+            last_phase, last_fg = sample.phase, fg
 
     print(f"stream ended after {n} samples (batch was authored for 50)")
 
