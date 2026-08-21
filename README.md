@@ -169,20 +169,80 @@ To change an actual value — a flow rate, `T_sp`, `pH_sp` — rather than which
 phase is active, use `set_setpoint`/`set_setpoints`. These force a fixed
 number regardless of what the active phase's `SetpointProfile` authors, and
 (unlike the phase hooks above) persist across phase transitions until you
-clear them:
+clear them.
+
+Valid names are any `ResolvedSetpoints` field — an unknown name raises
+`ValueError`:
+
+| name | meaning |
+|---|---|
+| `Fs` | substrate (sugar) feed rate |
+| `Foil` | oil feed rate |
+| `Fg` | aeration / gas flow rate |
+| `pressure` | vessel headspace pressure setpoint |
+| `Fdischarge` | harvest/discharge flow rate |
+| `Fwater` | dilution water flow rate |
+| `Fpaa` | PAA precursor feed rate |
+| `T_sp` | temperature setpoint (Kelvin) |
+| `pH_sp` | pH setpoint |
+
+These are the only things you can directly force to a value. The rest of
+`sample.controls` (`RPM`, `Fa`, `Fb`, `Fc`, `Fh`, `viscosity`, `Fremoved`)
+are PID/controller *outputs* computed each step from `T_sp`/`pH_sp` and
+internal state — not independent setpoints. To change cooling duty (`Fc`)
+or acid/base dosing (`Fa`/`Fb`), change `T_sp`/`pH_sp` and let the PID react
+to it; you can't pin those directly.
+
+**Set:**
 
 ```python
-stream.control.set_setpoint("T_sp", 305.0)      # bump temperature setpoint
+stream.control.set_setpoint("T_sp", 305.0)       # one value
 stream.control.set_setpoints(Fg=60.0, pH_sp=6.8) # several at once
-
-stream.control.overrides          # {'T_sp': 305.0, 'Fg': 60.0, 'pH_sp': 6.8}
-stream.control.clear_setpoint("T_sp")            # revert just T_sp
-stream.control.clear_all_setpoints()             # revert everything
 ```
 
-Valid names are any `ResolvedSetpoints` field: the 7 feed channels (`Fs`,
-`Foil`, `Fg`, `pressure`, `Fdischarge`, `Fwater`, `Fpaa`) plus `T_sp` and
-`pH_sp`. An unknown name raises `ValueError`.
+**Get:**
+
+```python
+stream.control.overrides           # {'T_sp': 305.0, 'Fg': 60.0, 'pH_sp': 6.8}
+                                    # — currently active overrides only
+
+sample.state["T"]                  # any of the 33 actual ODE states
+sample.controls["Fg"]              # any of the 12 actual actuator outputs
+                                    # (the resolved value the controller used,
+                                    # override or not)
+```
+
+**Clear:**
+
+```python
+stream.control.clear_setpoint("T_sp")  # revert just T_sp to the phase's authored value
+stream.control.clear_all_setpoints()   # revert everything
+```
+
+#### Single-thread step loop
+
+You don't need a second thread at all if your analysis and control
+decisions happen in the same place you're consuming samples.
+`SampleStream` is a normal iterator, so drive it step by step with
+`.next()` (or the builtin `next(stream)` — they're equivalent) instead of
+`for`/`list()`:
+
+```python
+stream = simulate_iter(spec)
+
+while True:
+    try:
+        sample = stream.next()
+    except StopIteration:
+        break               # batch finished (or was aborted)
+
+    # --- your analysis ---
+    if sample.state["T"] > 305.0:
+        # --- your control decision ---
+        stream.control.set_setpoint("Fc", 50.0)   # e.g. bump cooling flow
+    if sample.k == 100:
+        stream.control.pause()
+```
 
 ### Recipe layer (optional)
 

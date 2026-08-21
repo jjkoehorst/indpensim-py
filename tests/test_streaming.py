@@ -58,6 +58,23 @@ def test_simulate_iter_control_is_none_without_recipe(short_spec):
     assert len(list(stream)) == expected
 
 
+def test_sample_stream_next_matches_manual_while_loop(short_spec):
+    """.next() supports a manual while-loop driver, equivalent to next()."""
+    from indpensim.simulation import simulate_iter
+
+    stream = simulate_iter(short_spec)
+    expected = int(round(short_spec.T / short_spec.h))
+    samples = []
+    while True:
+        try:
+            samples.append(stream.next())
+        except StopIteration:
+            break
+    assert len(samples) == expected
+    assert samples[0].k == 1
+    assert samples[-1].k == expected
+
+
 def test_simulate_iter_matches_simulate(short_spec):
     """Regression gate: collect all yielded samples, reconstruct trajectory,
     compare to simulate()'s SimulationResult."""

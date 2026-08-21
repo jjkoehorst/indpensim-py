@@ -19,17 +19,21 @@ import numpy as np
 
 from indpensim.driver import BatchConfig, CampaignConfig, batch_spec_from_python_rng
 from indpensim.recipe import legacy_sbc_recipe
-from indpensim.simulation import simulate_iter
+from indpensim.simulation import SampleStream, simulate_iter
 from indpensim.streaming.pacing import Pacing, paced
 
 
-def operator_console(stream) -> None:
+def operator_console(stream: SampleStream) -> None:
     """Runs on a background thread while the main thread streams samples.
 
     Timed to land well before INOCULATE's own 4h/20-sample trigger would
     naturally fire, so each effect below is unambiguously due to the call
     that produced it, not a coincidence with the recipe's own schedule.
     """
+    # `.control` is `RecipeExecutor | None` (None only for a batch with no
+    # attached Recipe) — this spec always attaches one, so assert it here
+    # once rather than under every call below.
+    assert stream.control is not None
     time.sleep(0.3)
     print("[console] pausing the recipe")
     stream.control.pause()

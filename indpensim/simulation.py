@@ -406,7 +406,7 @@ class _SimulationRun:
     def finalize(self) -> None:
         """Apply post-loop conversions to history/states for backward-compat
         with the original ``SimulationResult`` shape."""
-        self.pH_trajectory = -np.log10(self.states[:, 6])
+        self.pH_trajectory = -np.log10(np.maximum(self.states[:, 6], 1e-30))
         self.states[:, 8] = self.states[:, 8] / 1000.0
         self.history.channels["pH"][:] = -np.log10(
             np.maximum(self.history.channels["pH"][:], 1e-30)
@@ -474,6 +474,16 @@ class SampleStream:
 
     def __iter__(self) -> "SampleStream":
         return self
+
+    def next(self) -> Sample:
+        """Alias for ``next(stream)`` — advance one step and return its
+        ``Sample``, for a manual ``while True: sample = stream.next()``
+        loop (raises ``StopIteration`` at the end, same as the builtin).
+        Prefer this over the ``for``/``list()`` form when you need to
+        interleave your own analysis and ``.control`` calls between steps
+        in a single thread, rather than reacting from a second thread.
+        """
+        return next(self)
 
     def __next__(self) -> Sample:
         if self._done:
