@@ -31,7 +31,10 @@ DEFAULT_NO_LV: int = 4
 _FEATURE_WINDOWS = (slice(349, 500), slice(799, 860))
 EXPECTED_FEATURE_LEN = 151 + 61   # = 212; must match coefficient row width
 
-_DEFAULT_MAT_PATH = Path(__file__).resolve().parents[2] / "data" / "PAA_PLS_model.mat"
+# Lives under indpensim/data/ (inside the package) so it ships with the
+# installed wheel — see the matching note on _REFERENCE_SPECTRA_PATH in
+# simulation.py.
+_DEFAULT_MAT_PATH = Path(__file__).resolve().parents[1] / "data" / "PAA_PLS_model.mat"
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,7 @@ class PAAPLSModel:
 
     @classmethod
     def load(cls, mat_path: Path | str | None = None, no_lv: int = DEFAULT_NO_LV) -> "PAAPLSModel":
-        """Load coefficients from PAA_PLS_model.mat (default: data/PAA_PLS_model.mat)."""
+        """Load coefficients from PAA_PLS_model.mat (default: indpensim/data/PAA_PLS_model.mat)."""
         path = Path(mat_path) if mat_path is not None else _DEFAULT_MAT_PATH
         raw = scipy.io.loadmat(str(path), squeeze_me=False, struct_as_record=True)
         if "b" not in raw:

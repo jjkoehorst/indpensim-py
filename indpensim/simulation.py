@@ -44,7 +44,10 @@ from indpensim.recipe.executor import RecipeExecutor
 from indpensim.recipe.types import PhaseState
 from indpensim.streaming.sample import Sample, StreamConfig
 
-_REFERENCE_SPECTRA_PATH = Path(__file__).resolve().parents[1] / "data" / "reference_Specra.txt"
+# Lives under indpensim/data/ (inside the package), not a repo-root data/ —
+# hatchling only ships files under `packages`, so a repo-root path here would
+# silently 404 once installed as a pip dependency rather than run from a checkout.
+_REFERENCE_SPECTRA_PATH = Path(__file__).resolve().parent / "data" / "reference_Specra.txt"
 
 
 # Map state index → BatchHistory channel name (for post-step storage).

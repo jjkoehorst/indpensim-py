@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-REF_PATH = Path(__file__).resolve().parents[1] / "data" / "reference_Specra.txt"
+REF_PATH = Path(__file__).resolve().parents[1] / "indpensim" / "data" / "reference_Specra.txt"
 
 
 @pytest.fixture(scope="module")

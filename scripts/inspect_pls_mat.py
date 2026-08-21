@@ -56,5 +56,5 @@ def main(path: Path) -> int:
 
 
 if __name__ == "__main__":
-    p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/PAA_PLS_model.mat")
+    p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("indpensim/data/PAA_PLS_model.mat")
     sys.exit(main(p))
