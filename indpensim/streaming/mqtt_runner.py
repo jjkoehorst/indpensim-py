@@ -73,6 +73,10 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="pacing: fast | fixed:<sec> | accelerated:<factor> (default fixed:2.0)")
     p.add_argument("--raman-every", type=int, default=15,
                    help="emit Raman spectrum every Nth sample (default 15 = ~30s wall at fixed:2.0)")
+    p.add_argument("--sample-period", type=float, default=None,
+                   help="simulated seconds between sensor samples (must divide 720; "
+                        "default: one per 12-min control step). Pair with "
+                        "--pace accelerated:<factor>, e.g. 10 + accelerated:1500")
     p.add_argument("--lab-every", type=int, default=60,
                    help="emit lab measurement every Nth sample (default 60 = 12 sim-h)")
 
@@ -144,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
 
     uns_cfg = UnsConfig(site=args.site, area=args.area, line=args.line,
                         equipment=args.equipment)
-    stream_cfg = StreamConfig(raman_every=args.raman_every, lab_every=args.lab_every)
+    stream_cfg = StreamConfig(raman_every=args.raman_every, lab_every=args.lab_every,
+                              sample_period_s=args.sample_period)
     pacer = parse_pace_spec(args.pace)
 
     # ---- Connect

@@ -111,6 +111,39 @@ def _apply_matlab_floors(y: np.ndarray) -> None:
         y[1] = 1.0
 
 
+def _state_dict(y: np.ndarray, OUR: float, CER: float) -> dict[str, float]:
+    """Named ODE states in plant-readable units (pH, Q converted)."""
+    return {
+        "S": float(y[0]), "DO2": float(y[1]), "O2": float(y[2]),
+        "P": float(y[3]), "V": float(y[4]), "Wt": float(y[5]),
+        "pH": float(-np.log10(max(y[6], 1e-30))),     # converted
+        "T": float(y[7]),
+        "Q": float(y[8]) / 1000.0,                      # converted
+        "Viscosity": float(y[9]), "Culture_age": float(y[10]),
+        "a0": float(y[11]), "a1": float(y[12]),
+        "a3": float(y[13]), "a4": float(y[14]),
+        "X": float(y[11] + y[12] + y[13] + y[14]),
+        "n0": float(y[15]), "n1": float(y[16]), "n2": float(y[17]),
+        "n3": float(y[18]), "n4": float(y[19]), "n5": float(y[20]),
+        "n6": float(y[21]), "n7": float(y[22]), "n8": float(y[23]),
+        "n9": float(y[24]), "nm": float(y[25]), "phi0": float(y[26]),
+        "CO2outgas": float(y[27]), "CO2_d": float(y[28]),
+        "PAA": float(y[29]), "NH3": float(y[30]),
+        "mu_P_calc": float(y[31]), "mu_X_calc": float(y[32]),
+        "OUR": OUR,
+        "CER": CER,
+    }
+
+
+def _controls_dict(u) -> dict[str, float]:
+    return {
+        "Fg": u.Fg, "RPM": u.RPM, "Fs": u.Fs, "Fa": u.Fa, "Fb": u.Fb,
+        "Fc": u.Fc, "Fh": u.Fh, "Fw": u.Fw, "pressure": u.pressure,
+        "viscosity": u.viscosity, "Fremoved": u.Fremoved,
+        "Fpaa": u.Fpaa, "Foil": u.Foil,
+    }
+
+
 def _build_inputs(u, cap: CapturedBatch, k: int, h_ode: float) -> np.ndarray:
     """Build the 26-element controller-input vector for ``rhs``.
 
@@ -142,10 +175,11 @@ def _build_inputs(u, cap: CapturedBatch, k: int, h_ode: float) -> np.ndarray:
 
 def _calc_OUR_CER(history: BatchHistory, k: int) -> tuple[float, float]:
     """Mirror of indpensim.m:335-339."""
+    return _our_cer(history.y("Fg", k), history.y("O2", k), history.y("CO2outgas", k))
+
+
+def _our_cer(Fg: float, O2: float, CO2outgas: float) -> tuple[float, float]:
     O2_in = 0.204
-    Fg = history.y("Fg", k)
-    O2 = history.y("O2", k)
-    CO2outgas = history.y("CO2outgas", k)
     OUR = (32 * Fg / 22.4) * (O2_in - O2 * (0.7902 / (1 - O2 - CO2outgas / 100)))
     CER = (44 * Fg / 22.4) * ((0.65 * CO2outgas / 100)
                               * (0.7902 / (1 - O2_in - CO2outgas / 100) - 0.0330))
@@ -188,6 +222,16 @@ class _SimulationRun:
         self.N = int(round(self.T / self.h))
         self.h_ode = self.h / 20.0
         self.t_grid = np.linspace(0.0, self.N * self.h, self.N + 1)
+        # Measurement points inside each control interval (excluding its end).
+        self.n_sub = 1
+        if self.stream_config.sample_period_s is not None:
+            n = self.h * 3600.0 / self.stream_config.sample_period_s
+            if n < 1 or abs(n - round(n)) > 1e-9:
+                raise ValueError(
+                    f"sample_period_s={self.stream_config.sample_period_s} must divide "
+                    f"the control interval h={self.h}h ({self.h * 3600:g}s)")
+            self.n_sub = int(round(n))
+        self.sub_samples: list[Sample] = []
 
         # Parameter vector — mutable: inhibition logic rewrites par[1] in place.
         self.par = Parameters.default(
@@ -259,14 +303,22 @@ class _SimulationRun:
 
         # ---- 3. Build inputs and integrate
         inp = _build_inputs(u, self.cap, k, self.h_ode)
+        # Dense output gives the true ODE state at each measurement point
+        # without changing the solver's steps, so the end value is unaffected.
+        t_eval = np.linspace(self.t_grid[k - 1], self.t_grid[k], self.n_sub + 1)[1:]
         sol = solve_ivp(
             rhs, [self.t_grid[k - 1], self.t_grid[k]], self.y_curr,
             args=(inp, self.par), method="BDF",
             rtol=self.rtol, atol=self.atol,
-            t_eval=[self.t_grid[k]],
+            t_eval=t_eval,
         )
         if not sol.success:
             raise RuntimeError(f"solve_ivp failed at sample {k}: {sol.message}")
+        self.sub_samples = []
+        for i in range(self.n_sub - 1):
+            y_i = sol.y[:, i].copy()
+            _apply_matlab_floors(y_i)
+            self.sub_samples.append(self._build_sub_sample(k, float(t_eval[i]), y_i, u))
         self.y_curr = sol.y[:, -1]
         _apply_matlab_floors(self.y_curr)
         self.states[k] = self.y_curr
@@ -336,35 +388,24 @@ class _SimulationRun:
         return self._build_sample(k, u, raman_sample)
 
     # ------------------------------------------------------------------
+    def _build_sub_sample(self, k: int, t_h: float, y: np.ndarray, u) -> Sample:
+        """Sensor snapshot between control actions: state only, no lab/Raman/events."""
+        OUR, CER = _our_cer(u.Fg, float(y[2]), float(y[27]))
+        phase: str | None = None
+        phase_state: str | None = None
+        if self.recipe_exec is not None:
+            phase = self.recipe_exec.current_phase.name
+            phase_state = self.recipe_exec.phase_state.value
+        return Sample(
+            k=k, sim_time_h=t_h, wall_time_s=None,
+            state=_state_dict(y, OUR, CER), controls=_controls_dict(u),
+            phase=phase, phase_state=phase_state,
+        )
+
     def _build_sample(self, k: int, u, raman_sample: list[float] | None) -> Sample:
         """Construct a Sample with plant-readable units (pH, Q converted)."""
-        y = self.y_curr
-        state = {
-            "S": float(y[0]), "DO2": float(y[1]), "O2": float(y[2]),
-            "P": float(y[3]), "V": float(y[4]), "Wt": float(y[5]),
-            "pH": float(-np.log10(max(y[6], 1e-30))),     # converted
-            "T": float(y[7]),
-            "Q": float(y[8]) / 1000.0,                      # converted
-            "Viscosity": float(y[9]), "Culture_age": float(y[10]),
-            "a0": float(y[11]), "a1": float(y[12]),
-            "a3": float(y[13]), "a4": float(y[14]),
-            "X": float(y[11] + y[12] + y[13] + y[14]),
-            "n0": float(y[15]), "n1": float(y[16]), "n2": float(y[17]),
-            "n3": float(y[18]), "n4": float(y[19]), "n5": float(y[20]),
-            "n6": float(y[21]), "n7": float(y[22]), "n8": float(y[23]),
-            "n9": float(y[24]), "nm": float(y[25]), "phi0": float(y[26]),
-            "CO2outgas": float(y[27]), "CO2_d": float(y[28]),
-            "PAA": float(y[29]), "NH3": float(y[30]),
-            "mu_P_calc": float(y[31]), "mu_X_calc": float(y[32]),
-            "OUR": self.history.y("OUR", k),
-            "CER": self.history.y("CER", k),
-        }
-        controls = {
-            "Fg": u.Fg, "RPM": u.RPM, "Fs": u.Fs, "Fa": u.Fa, "Fb": u.Fb,
-            "Fc": u.Fc, "Fh": u.Fh, "Fw": u.Fw, "pressure": u.pressure,
-            "viscosity": u.viscosity, "Fremoved": u.Fremoved,
-            "Fpaa": u.Fpaa, "Foil": u.Foil,
-        }
+        state = _state_dict(self.y_curr, self.history.y("OUR", k), self.history.y("CER", k))
+        controls = _controls_dict(u)
 
         offline: dict[str, float] | None = None
         cfg = self.stream_config
@@ -474,6 +515,7 @@ class SampleStream:
         self._run = run
         self._k = 0
         self._done = False
+        self._pending: list[Sample] = []   # this step's samples not yet handed out
 
     def __iter__(self) -> "SampleStream":
         return self
@@ -489,6 +531,8 @@ class SampleStream:
         return next(self)
 
     def __next__(self) -> Sample:
+        if self._pending:
+            return self._pending.pop(0)
         if self._done:
             raise StopIteration
         self._k += 1
@@ -497,11 +541,14 @@ class SampleStream:
             self._run.finalize()
             raise StopIteration
         sample = self._run.step(self._k)
+        # With sample_period_s, one step yields several samples; hand them out
+        # in time order. Control changes land at the next step boundary.
+        self._pending = [*self._run.sub_samples, sample]
         exec_ = self._run.recipe_exec
         if exec_ is not None and exec_.phase_state is PhaseState.ABORTED:
             self._done = True
             self._run.finalize()
-        return sample
+        return self._pending.pop(0)
 
     @property
     def control(self) -> RecipeExecutor | None:
@@ -518,7 +565,8 @@ def simulate_iter(
     raman_noise_traj: np.ndarray | None = None,
     stream_config: StreamConfig | None = None,
 ) -> SampleStream:
-    """Yield one ``Sample`` per integration step.
+    """Yield one ``Sample`` per integration step, or one per
+    ``stream_config.sample_period_s`` when set (several per step).
 
     Same physics as ``simulate()``. Use this for streaming sinks
     (MQTT, jsonlines, callbacks). Per-sample pH and Q are converted to

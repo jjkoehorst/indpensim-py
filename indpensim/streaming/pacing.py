@@ -27,7 +27,8 @@ class Pacer(Protocol):
     sim_time_h, decide how long to sleep before emitting this one (relative
     to the stream's wall-clock start).
     """
-    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float) -> float:
+    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float,
+                   index: int = 0) -> float:
         """Block until the sample should be emitted; return wall_time_s
         (seconds since stream start) at the moment of emission."""
         ...
@@ -35,7 +36,8 @@ class Pacer(Protocol):
 
 @dataclass(frozen=True)
 class _AsFastAsPossible:
-    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float) -> float:
+    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float,
+                   index: int = 0) -> float:
         return time.monotonic() - t0_wall
 
 
@@ -43,12 +45,10 @@ class _AsFastAsPossible:
 class _FixedInterval:
     seconds: float
 
-    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float) -> float:
-        # Emit sample k at t0_wall + (k - first_k) * seconds. We don't know
-        # first_k here directly, but we know sample.k. The first sample is
-        # whatever the iterator yields first; we anchor on t0_wall for k=1
-        # and assume k increments by 1.
-        target_offset = (sample.k - 1) * self.seconds
+    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float,
+                   index: int = 0) -> float:
+        # Count emitted samples, not k: sub-step samples share a k.
+        target_offset = index * self.seconds
         sleep_for = (t0_wall + target_offset) - time.monotonic()
         if sleep_for > 0:
             time.sleep(sleep_for)
@@ -59,7 +59,8 @@ class _FixedInterval:
 class _Accelerated:
     factor: float    # >1 = faster than real-time
 
-    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float) -> float:
+    def wait_until(self, sample: Sample, *, t0_wall: float, t0_sim_h: float,
+                   index: int = 0) -> float:
         # Target wall offset = (sim_time_h - t0_sim_h) * 3600 / factor
         target_offset_s = (sample.sim_time_h - t0_sim_h) * 3600.0 / self.factor
         sleep_for = (t0_wall + target_offset_s) - time.monotonic()
@@ -93,11 +94,11 @@ def paced(samples: Iterable[Sample], pacer: Pacer) -> Iterator[Sample]:
     stamps ``wall_time_s`` on the emitted Sample."""
     t0_wall: float | None = None
     t0_sim_h: float | None = None
-    for sample in samples:
+    for index, sample in enumerate(samples):
         if t0_wall is None:
             t0_wall = time.monotonic()
             t0_sim_h = sample.sim_time_h
-        wall_t = pacer.wait_until(sample, t0_wall=t0_wall, t0_sim_h=t0_sim_h)
+        wall_t = pacer.wait_until(sample, t0_wall=t0_wall, t0_sim_h=t0_sim_h, index=index)
         yield replace(sample, wall_time_s=wall_t)
 
 

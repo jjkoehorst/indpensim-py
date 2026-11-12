@@ -54,7 +54,12 @@ class StreamConfig:
             60×0.2 = 12h, matching MATLAB Off_line_m.
         lab_delay_samples: lab field carries values from k - delay (matches
             MATLAB Off_line_delay = 4h = 20 samples at h=0.2).
+        sample_period_s: emit a state sample every N simulated seconds
+            (must divide h). None = one sample per control step. Extra
+            samples share the step's k and controls; raman/offline/phase
+            events only appear on the step-end sample.
     """
     raman_every: int = 1
     lab_every: int = 60
     lab_delay_samples: int = 20
+    sample_period_s: float | None = None

@@ -224,3 +224,33 @@ def test_stream_config_gates_offline(short_spec):
     # Verify analyte set
     s = next(s for s in samples if s.k == 20)
     assert set(s.offline.keys()) == {"NH3", "P", "X", "PAA", "Viscosity"}
+
+
+# ---------------------------------------------------------------------------
+# Sub-step sampling: sensor data every N simulated seconds
+# ---------------------------------------------------------------------------
+
+def test_sample_period_yields_substeps_and_keeps_step_values(short_spec):
+    from indpensim.simulation import simulate_iter
+    from indpensim.streaming.sample import StreamConfig
+
+    base = list(simulate_iter(short_spec))
+    fine = list(simulate_iter(short_spec, stream_config=StreamConfig(sample_period_s=10)))
+
+    assert len(fine) == len(base) * 72                   # 720 s step / 10 s
+    dt_s = np.diff([s.sim_time_h for s in fine]) * 3600
+    assert np.allclose(dt_s, 10.0)
+    # Every 72nd sample is the step end and must equal the unsampled run.
+    for b, f in zip(base, fine[71::72]):
+        assert f.k == b.k
+        assert f.state["P"] == pytest.approx(b.state["P"], rel=1e-9)
+        assert f.state["DO2"] == pytest.approx(b.state["DO2"], rel=1e-9)
+        assert f.raman == b.raman
+
+
+def test_sample_period_must_divide_step(short_spec):
+    from indpensim.simulation import simulate_iter
+    from indpensim.streaming.sample import StreamConfig
+
+    with pytest.raises(ValueError):
+        next(simulate_iter(short_spec, stream_config=StreamConfig(sample_period_s=7)))
